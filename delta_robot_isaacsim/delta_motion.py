@@ -5,9 +5,6 @@ import time
 import logging
 from typing import Tuple, List
 
-# 設置日誌記錄
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 @dataclass
 class Point:
@@ -20,6 +17,35 @@ class Angle:
     Theta1: float = 0.0
     Theta2: float = 0.0
     Theta3: float = 0.0
+
+class PositionManager:
+    """位置管理類別，管理待命位置和丟棄位置"""
+    
+    def __init__(self):
+        # 待命位置座標 (300, 300, -550)
+        self.standby_position = Point(300.0, 300.0, -550.0)
+        # 丟棄位置座標 (與待命位置相同)
+        self.drop_position = Point(300.0, 300.0, -550.0)
+    
+    def get_standby_position(self):
+        """獲取待命位置"""
+        return self.standby_position
+    
+    def get_drop_position(self):
+        """獲取丟棄位置"""
+        return self.drop_position
+    
+    def is_standby_position(self, point):
+        """檢查是否為待命位置"""
+        return (abs(point.X - self.standby_position.X) < 0.1 and
+                abs(point.Y - self.standby_position.Y) < 0.1 and
+                abs(point.Z - self.standby_position.Z) < 0.1)
+    
+    def is_drop_position(self, point):
+        """檢查是否為丟棄位置"""
+        return (abs(point.X - self.drop_position.X) < 0.1 and
+                abs(point.Y - self.drop_position.Y) < 0.1 and
+                abs(point.Z - self.drop_position.Z) < 0.1)
 
 class DeltaKinematics:
     def __init__(self):
@@ -52,7 +78,6 @@ class DeltaKinematics:
         a = (x0*x0 + y0*y0 + z0*z0 + self.RD_RF_Pow2 - self.RD_RE_Pow2 - y1*y1) / (2.0*z0)
         b = (y1 - y0) / z0
 
-        # 判別式
         d = -(a + b*y1)*(a + b*y1) + self.RD_RF_Pow2*(b*b + 1.0)
 
         if d < 0:
@@ -105,7 +130,7 @@ class TrajectoryPlanner:
         self.dt = 1.0 / frequency
         
     def wrap_to_pi(self, angle: float) -> float:
-        """將角度包裝到 [-π, π] 範圍內"""
+        """符合isaacsim將角度包裝到 [-π, π] 範圍內"""
         while angle > math.pi:
             angle -= 2 * math.pi
         while angle < -math.pi:
@@ -142,7 +167,9 @@ class TrajectoryPlanner:
 class DeltaMotion:
     def __init__(self):
         self.kinematics = DeltaKinematics()
-        self.trajectory_planner = TrajectoryPlanner(frequency=200.0)  # 改為 200 Hz
+        self.trajectory_planner = TrajectoryPlanner(frequency=200.0) 
+        self.position_manager = PositionManager()  # 新增位置管理器
+        
         # 將初始角度從度數轉換為弧度
         self.current_angle = Angle(
             math.radians(-38.0), 
@@ -156,7 +183,7 @@ class DeltaMotion:
     
     def check_angle_limits(self, angle):
         """檢查角度是否在限制範圍內"""
-        # 將弧度轉換為度數進行比較
+        # 預留0.05度應對極限情況
         min_angle_deg = -38.05
         max_angle_deg = 90.05
         
@@ -173,13 +200,6 @@ class DeltaMotion:
     def execute_smooth_motion(self, target_angles, current_angles):
         """執行平滑運動到目標角度"""
         try:
-            logger.info(f"開始軌跡規劃: 目標角度 {[f'{math.degrees(angle):.1f}' for angle in target_angles]}")
-            
-            # 檢查輸入參數
-            if len(current_angles) != 3 or len(target_angles) != 3:
-                logger.warning(f"角度參數錯誤: current={current_angles}, target={target_angles}")
-                return None
-            
             # 為每個關節生成均速軌跡
             trajectories = []
             
@@ -203,7 +223,6 @@ class DeltaMotion:
             return trajectories
             
         except Exception as e:
-            logger.error(f"執行平滑運動時發生錯誤: {str(e)}")
             import traceback
             traceback.print_exc()
             return None

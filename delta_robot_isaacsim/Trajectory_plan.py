@@ -42,6 +42,7 @@ class TrajectoryPlanNode(Node):
         self.declare_parameter('offset_x', 0.0)
         self.declare_parameter('offset_y', 0.0)
         self.declare_parameter('offset_z', 0.0)
+        self.declare_parameter('tvec', [0.0])
 
     def _init_variables(self):
         """取得ROS2參數"""
@@ -57,20 +58,23 @@ class TrajectoryPlanNode(Node):
         offset_y = self.get_parameter('offset_y').get_parameter_value().double_value
         offset_z = self.get_parameter('offset_z').get_parameter_value().double_value
         # self.tvec = self._get_camera2delta_tf()
+        tvec = self.get_parameter('tvec').get_parameter_value().double_array_value
 
         self.delta_working_level = np.array(delta_working_level)
         self.D = np.array(D)
         self.K = np.array(K).reshape(3, 3)  # 相機內參矩陣通常是 3x3
         self.rvec = np.array(rvec)
         self.offset = np.array([offset_x, offset_y, offset_z])
-
+        self.tvec = np.array(tvec)
+        
         # 印出參數值確認
         self.get_logger().info(f'Delta工作高度: {self.delta_working_level}')
         self.get_logger().info(f'畸變矩陣: {self.D}')
         self.get_logger().info(f'相機矩陣: {self.K}')
         self.get_logger().info(f'剛體旋轉矩陣: {self.rvec}')
         self.get_logger().info(f'座標偏移量: {self.offset}')
-
+        self.get_logger().info(f'相機到Delta的平移向量: {self.tvec}')
+        
     def _get_camera2delta_tf(self):
         """取得D455f與Delta的平移向量"""
         delta1_tf = self.tf_buffer.lookup_transform(
@@ -111,7 +115,7 @@ class TrajectoryPlanNode(Node):
         return tvec
 
     def cords_callback(self, msg):
-        self.tvec = self._get_camera2delta_tf()
+        # self.tvec = self._get_camera2delta_tf()
 
         self.get_logger().info("接收去除目標點")
         groups_size = msg.layout.dim[0].size
@@ -275,10 +279,16 @@ class TrajectoryPlanNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = TrajectoryPlanNode()
+    node = TrajectoryPlanNode()  # 或 TrajectoryPlanNode()
+    
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        pass
-    node.destroy_node()
-    rclpy.shutdown()
+        node.get_logger().info("收到中斷信號，正在關閉...")
+    finally:
+        try:
+            node.destroy_node()
+            rclpy.shutdown()
+        except Exception as e:
+            # 忽略關閉時的錯誤
+            pass

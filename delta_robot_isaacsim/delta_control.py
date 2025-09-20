@@ -8,7 +8,7 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, Bool
 from delta_robot_isaacsim.delta_motion import DeltaMotion, Point as DeltaPoint
 import math
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -36,6 +36,13 @@ class DeltaRobotController(Node):
         self.angle_pub = self.create_publisher(
             JointState,
             '/target',
+            10
+        )
+        
+        # 新增執行完成狀態發布者
+        self.execution_complete_pub = self.create_publisher(
+            Bool,
+            'delta_execution_complete',
             10
         )
         
@@ -95,7 +102,7 @@ class DeltaRobotController(Node):
         self.execute_trajectory(points)
 
     def execute_trajectory(self, points):
-        """執行軌跡點序列"""
+        """執行軌跡點序列（批次處理模式）"""
         if self.is_executing:
             self.get_logger().warn("正在執行其他軌跡，請稍後再試")
             return False
@@ -104,33 +111,76 @@ class DeltaRobotController(Node):
         self.hold_mode = False
         
         try:
-            for i, point in enumerate(points):
-                point_start_time = time.time()
-                self.get_logger().info(f"執行第 {i+1}/{len(points)} 個點: X={point.X:.2f}, Y={point.Y:.2f}, Z={point.Z:.2f}")
+            # 1. 首先移動到待命位置
+            self.get_logger().info("開始執行軌跡，首先移動到待命位置...")
+            if not self.move_to_standby_position():
+                self.get_logger().error("移動到待命位置失敗，中止執行")
+                self.is_executing = False
+                return False
+            
+            # 2. 檢查點數是否為3的倍數（批次處理）
+            if len(points) % 3 != 0:
+                self.get_logger().error(f"點數 {len(points)} 不是3的倍數，無法進行批次處理")
+                self.is_executing = False
+                return False
+            
+            # 3. 按3點一組進行批次處理
+            num_groups = len(points) // 3
+            self.get_logger().info(f"開始批次處理，共 {num_groups} 組，每組3個點")
+            
+            for group_idx in range(num_groups):
+                self.get_logger().info(f"執行第 {group_idx + 1}/{num_groups} 組")
                 
-                # 計算逆運動學
-                angles = self.motion_controller.kinematics.inverse_kinematics(point)
+                # 獲取當前組的3個點
+                group_points = points[group_idx * 3:(group_idx + 1) * 3]
                 
-                if angles is None:
-                    self.get_logger().error(f"第 {i+1} 個點逆運動學計算失敗，點不可達")
+                # 執行3點序列：上方(-550) → 目標(-625) → 拔起(-550)
+                for point_idx, point in enumerate(group_points):
+                    point_start_time = time.time()
+                    self.get_logger().info(f"執行第 {group_idx + 1} 組第 {point_idx + 1} 點: X={point.X:.2f}, Y={point.Y:.2f}, Z={point.Z:.2f}")
+                    
+                    # 計算逆運動學
+                    angles = self.motion_controller.kinematics.inverse_kinematics(point)
+                    
+                    if angles is None:
+                        self.get_logger().error(f"第 {group_idx + 1} 組第 {point_idx + 1} 點逆運動學計算失敗，點不可達")
+                        self.is_executing = False
+                        return False
+                    
+                    # 檢查角度範圍
+                    if not self.motion_controller.check_angle_limits(angles):
+                        self.get_logger().error(f"第 {group_idx + 1} 組第 {point_idx + 1} 點角度超出限制")
+                        self.is_executing = False
+                        return False
+                    
+                    # 執行平滑軌跡
+                    success = self.execute_smooth_motion(angles)
+                    if not success:
+                        self.get_logger().error(f"第 {group_idx + 1} 組第 {point_idx + 1} 點軌跡執行失敗")
+                        self.is_executing = False
+                        return False
+                    
+                    point_execution_time = time.time() - point_start_time
+                    self.get_logger().info(f"第 {group_idx + 1} 組第 {point_idx + 1} 點執行完成，耗時: {point_execution_time:.2f} 秒")
+                
+                # 每組完成後移動到丟棄位置
+                self.get_logger().info(f"第 {group_idx + 1} 組完成，移動到丟棄位置...")
+                if not self.move_to_drop_position():
+                    self.get_logger().error(f"第 {group_idx + 1} 組完成後移動到丟棄位置失敗")
                     self.is_executing = False
                     return False
                 
-                # 檢查角度範圍
-                if not self.motion_controller.check_angle_limits(angles):
-                    self.get_logger().error(f"第 {i+1} 個點角度超出限制: θ1={math.degrees(angles.Theta1):.2f}°, θ2={math.degrees(angles.Theta2):.2f}°, θ3={math.degrees(angles.Theta3):.2f}°")
-                    self.is_executing = False
-                    return False
-                
-                # 執行平滑軌跡
-                success = self.execute_smooth_motion(angles)
-                if not success:
-                    self.get_logger().error(f"第 {i+1} 個點軌跡執行失敗")
-                    self.is_executing = False
-                    return False
-                
-                point_execution_time = time.time() - point_start_time
-                self.get_logger().info(f"第 {i+1} 個點執行完成，耗時: {point_execution_time:.2f} 秒")
+                self.get_logger().info(f"第 {group_idx + 1} 組批次處理完成")
+            
+            # 4. 所有批次完成後返回待命位置
+            self.get_logger().info("所有批次完成，返回待命位置...")
+            if not self.move_to_standby_position():
+                self.get_logger().error("返回待命位置失敗")
+                self.is_executing = False
+                return False
+            
+            # 5. 發布執行完成狀態
+            self.publish_execution_complete()
             
             self.get_logger().info("所有軌跡點執行完成")
             self.hold_mode = True
@@ -209,6 +259,63 @@ class DeltaRobotController(Node):
         self.joint_state.header.stamp = self.get_clock().now().to_msg()
         self.angle_pub.publish(self.joint_state)
     
+    def move_to_standby_position(self):
+        """移動到待命位置"""
+        standby_point = self.motion_controller.position_manager.get_standby_position()
+        self.get_logger().info(f"移動到待命位置: ({standby_point.X}, {standby_point.Y}, {standby_point.Z})")
+        
+        # 計算逆運動學
+        angles = self.motion_controller.kinematics.inverse_kinematics(standby_point)
+        if angles is None:
+            self.get_logger().error("待命位置逆運動學計算失敗")
+            return False
+        
+        # 檢查角度範圍
+        if not self.motion_controller.check_angle_limits(angles):
+            self.get_logger().error("待命位置角度超出限制")
+            return False
+        
+        # 執行平滑運動
+        success = self.execute_smooth_motion(angles)
+        if success:
+            self.get_logger().info("成功移動到待命位置")
+        else:
+            self.get_logger().error("移動到待命位置失敗")
+        
+        return success
+    
+    def move_to_drop_position(self):
+        """移動到丟棄位置"""
+        drop_point = self.motion_controller.position_manager.get_drop_position()
+        self.get_logger().info(f"移動到丟棄位置: ({drop_point.X}, {drop_point.Y}, {drop_point.Z})")
+        
+        # 計算逆運動學
+        angles = self.motion_controller.kinematics.inverse_kinematics(drop_point)
+        if angles is None:
+            self.get_logger().error("丟棄位置逆運動學計算失敗")
+            return False
+        
+        # 檢查角度範圍
+        if not self.motion_controller.check_angle_limits(angles):
+            self.get_logger().error("丟棄位置角度超出限制")
+            return False
+        
+        # 執行平滑運動
+        success = self.execute_smooth_motion(angles)
+        if success:
+            self.get_logger().info("成功移動到丟棄位置")
+        else:
+            self.get_logger().error("移動到丟棄位置失敗")
+        
+        return success
+    
+    def publish_execution_complete(self):
+        """發布執行完成狀態"""
+        complete_msg = Bool()
+        complete_msg.data = True
+        self.execution_complete_pub.publish(complete_msg)
+        self.get_logger().info("發布執行完成狀態")
+
     def control_loop(self):
         """主控制迴路"""
         if self.hold_mode and not self.is_executing:
@@ -217,15 +324,19 @@ class DeltaRobotController(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    controller = DeltaRobotController()
+    node = DeltaRobotController()  # 或 TrajectoryPlanNode()
     
     try:
-        rclpy.spin(controller)
+        rclpy.spin(node)
     except KeyboardInterrupt:
-        pass
+        node.get_logger().info("收到中斷信號，正在關閉...")
     finally:
-        controller.destroy_node()
-        rclpy.shutdown()
+        try:
+            node.destroy_node()
+            rclpy.shutdown()
+        except Exception as e:
+            # 忽略關閉時的錯誤
+            pass
 
 if __name__ == '__main__':
     main()
